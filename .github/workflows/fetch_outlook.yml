@@ -1,0 +1,87 @@
+name: Fetch Outlook Files and Generate Files
+
+on:
+  workflow_dispatch:
+  # Optional: zeitgesteuert statt extern ausloesen (UTC)
+  # schedule:
+  #   - cron: "*/30 * * * *"
+
+concurrency:
+  # verhindert, dass zwei Laeufe gleichzeitig dieselben Dateien generieren/hochladen
+  group: fetch-outlook
+  cancel-in-progress: false
+
+jobs:
+  fetch_outlook:
+    name: Outlook
+    runs-on: ubuntu-latest
+    timeout-minutes: 10 # Sicherheitsnetz, falls Download/Zuschnitt haengt
+    env:
+      R2_PREFIX: outlook
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Cache Python packages
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download Outlook and clip to Germany (mit Retry)
+        run: |
+          MAX_ATTEMPTS=5
+          SLEEP_SECONDS=10
+
+          for i in $(seq 1 "$MAX_ATTEMPTS"); do
+            if python scripts/outlook.py --out output/outlook; then
+              echo "[Outlook] Erfolgreich (Versuch $i/$MAX_ATTEMPTS)."
+              exit 0
+            fi
+            echo "[Outlook] Versuch $i/$MAX_ATTEMPTS fehlgeschlagen, warte ${SLEEP_SECONDS}s..."
+            sleep "$SLEEP_SECONDS"
+          done
+          echo "::error::[Outlook] Nach $MAX_ATTEMPTS Versuchen nicht erfolgreich - Abbruch."
+          exit 1
+
+      - name: Check output
+        run: |
+          for t in sturm gewitter starkregen; do
+            test -s "output/outlook/$t.json"
+          done
+          ls -l output/outlook
+
+      - name: Upload zu R2 (mit Retry)
+        run: |
+          MAX_ATTEMPTS=3
+          for i in $(seq 1 "$MAX_ATTEMPTS"); do
+            # --delete entfernt Dateien im Prefix outlook/, die es lokal nicht mehr gibt
+            if aws s3 sync ./output/outlook \
+                "s3://${{ secrets.R2_BUCKET }}/${R2_PREFIX}/" \
+                --exclude "*" --include "*.json" \
+                --delete \
+                --content-type application/json \
+                --metadata "generated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com; then
+              echo "Upload erfolgreich (Versuch $i/$MAX_ATTEMPTS)."
+              exit 0
+            fi
+            echo "Upload fehlgeschlagen (Versuch $i/$MAX_ATTEMPTS), warte 10s..."
+            sleep 10
+          done
+          echo "::error::Upload nach $MAX_ATTEMPTS Versuchen fehlgeschlagen."
+          exit 1
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
